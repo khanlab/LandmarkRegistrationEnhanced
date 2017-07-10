@@ -44,7 +44,7 @@ class LandmarkRegistrationEnhancedWidget:
   def __init__(self, parent = None):
     settings = qt.QSettings()
     self.developerMode = settings.value('Developer/DeveloperMode').lower() == 'true'
-    self.logic = LandmarkRegistrationLogic()
+    self.logic = LandmarkRegistrationEnhancedLogic()
     self.logic.registationState = self.registationState
     self.sliceNodesByViewName = {}
     self.sliceNodesByVolumeID = {}
@@ -104,10 +104,6 @@ class LandmarkRegistrationEnhancedWidget:
         reloadFormLayout.addWidget(button)
         button.connect('clicked()', lambda s=scenario: self.onReloadAndTest(scenario=s))
 
-    self.selectVolumesButton = qt.QPushButton("Select Volumes To Register")
-    self.selectVolumesButton.connect('clicked(bool)', self.enter)
-    self.layout.addWidget(self.selectVolumesButton)
-
     self.interfaceFrame = qt.QWidget(self.parent)
     self.interfaceFrame.setLayout(qt.QVBoxLayout())
     self.layout.addWidget(self.interfaceFrame)
@@ -119,6 +115,20 @@ class LandmarkRegistrationEnhancedWidget:
     parametersCollapsibleButton.text = "Parameters"
     self.interfaceFrame.layout().addWidget(parametersCollapsibleButton)
     parametersFormLayout = qt.QFormLayout(parametersCollapsibleButton)
+
+    self.fiducialSelectors={}  
+    for viewName in ('Fixed', 'Moving'):
+      self.fiducialSelectors[viewName] = slicer.qMRMLNodeComboBox()
+      self.fiducialSelectors[viewName].nodeTypes = ( ("vtkMRMLMarkupsFiducialNode"), "" )
+      self.fiducialSelectors[viewName].selectNodeUponCreation = False
+      self.fiducialSelectors[viewName].addEnabled = False
+      self.fiducialSelectors[viewName].removeEnabled = True
+      self.fiducialSelectors[viewName].noneEnabled = True
+      self.fiducialSelectors[viewName].showHidden = False
+      self.fiducialSelectors[viewName].showChildNodeTypes = True
+      self.fiducialSelectors[viewName].setMRMLScene( slicer.mrmlScene )
+      self.fiducialSelectors[viewName].setToolTip( "Pick the %s fiducial." % viewName.lower() )
+      parametersFormLayout.addRow("%s Fiducials " % viewName, self.fiducialSelectors[viewName])
 
     self.volumeSelectors = {}
     for viewName in self.viewNames:
@@ -132,9 +142,10 @@ class LandmarkRegistrationEnhancedWidget:
       self.volumeSelectors[viewName].showChildNodeTypes = True
       self.volumeSelectors[viewName].setMRMLScene( slicer.mrmlScene )
       self.volumeSelectors[viewName].setToolTip( "Pick the %s volume." % viewName.lower() )
-      self.volumeSelectors[viewName].enabled = False
+      self.volumeSelectors[viewName].enabled = True
       parametersFormLayout.addRow("%s Volume " % viewName, self.volumeSelectors[viewName])
-
+    
+    self.volumeSelectors["Transformed"].enabled = False  
     self.volumeSelectors["Transformed"].addEnabled = True
     self.volumeSelectors["Transformed"].selectNodeUponCreation = True
     self.volumeSelectors["Transformed"].setToolTip( "Pick the transformed volume, which is the target for the registration." )
@@ -148,9 +159,16 @@ class LandmarkRegistrationEnhancedWidget:
     self.transformSelector.showHidden = False
     self.transformSelector.showChildNodeTypes = False
     self.transformSelector.setMRMLScene( slicer.mrmlScene )
-    self.transformSelector.setToolTip( "The transform for linear registration" )
+    self.transformSelector.setToolTip( "The transform for registration" )
     self.transformSelector.enabled = False
     parametersFormLayout.addRow("Target Transform ", self.transformSelector)
+
+
+    # Apply button
+    self.applyButton = qt.QPushButton("Apply Parameters")
+    self.applyButton.setStyleSheet("background-color: #FFFF99")
+    self.applyButton.connect('clicked(bool)', self.onApply)
+    parametersFormLayout.addWidget(self.applyButton)
 
     #
     # Visualization Widget
@@ -250,61 +268,168 @@ class LandmarkRegistrationEnhancedWidget:
 
     # Add vertical spacer
     self.layout.addStretch(1)
+  
+  def onApply(self):
+    self.InitializeRegistration()
 
-  def enter(self):
-    self.interfaceFrame.enabled = False
-    self.setupDialog()
+  def InitializeRegistration(self):
+  
+    fixedVolumeNode = self.volumeSelectors['Fixed'].currentNode()
+    movingVolumeNode = self.volumeSelectors['Moving'].currentNode()
+   
+    if not (fixedVolumeNode and movingVolumeNode):
+       print ("please specify fixed and moving volumes!")
+       return
 
-  def setupDialog(self):
-    """setup dialog"""
+    # create transform and transformed
+    transform = self.transformSelector.currentNode()
+    if not transform:
+      self.transformSelector.addNode()
+      transform = self.transformSelector.currentNode()
+      transform.SetName(movingVolumeNode.GetName()+"-transform")
 
-    if not self.volumeSelectDialog:
-      self.volumeSelectDialog = qt.QDialog(slicer.util.mainWindow())
-      self.volumeSelectDialog.objectName = 'LandmarkRegistrationVolumeSelect'
-      self.volumeSelectDialog.setLayout( qt.QVBoxLayout() )
+    transformed = self.volumeSelectors['Transformed'].currentNode()
+    if not transformed:
+      volumesLogic = slicer.modules.volumes.logic()
+      transformedName = "%s-transformed" % movingVolumeNode.GetName()
+      transformed = slicer.util.getNode(transformedName)
+      if not transformed:
+        transformed = volumesLogic.CloneVolume(slicer.mrmlScene, movingVolumeNode, transformedName)
+      transformed.SetAndObserveTransformNodeID(transform.GetID())
+    self.volumeSelectors['Transformed'].setCurrentNode(transformed)
+    
+    self.interfaceFrame.enabled = True
 
-      self.volumeSelectLabel = qt.QLabel()
-      self.volumeSelectDialog.layout().addWidget( self.volumeSelectLabel )
+    #set up fixed,moving and transform fiducials
+    fixedFiducialNodeTemp = self.fiducialSelectors["Fixed"].currentNode()
+    movingFiducialNodeTemp = self.fiducialSelectors["Moving"].currentNode()
 
-      self.volumeSelectorFrame = qt.QFrame()
-      self.volumeSelectorFrame.objectName = 'VolumeSelectorFrame'
-      self.volumeSelectorFrame.setLayout( qt.QFormLayout() )
-      self.volumeSelectDialog.layout().addWidget( self.volumeSelectorFrame )
+    if (fixedFiducialNodeTemp and movingFiducialNodeTemp):
+      #add fixed fiducial
+      point=[0,0,0]
+      for index in range(fixedFiducialNodeTemp.GetNumberOfFiducials()):
+        fixedFiducialNodeTemp.GetMarkupPoint(index, 0, point)
+        name='L-'+str(index)
+        self.logic.addFiducial(name,position=point,associatedNode=fixedVolumeNode)
 
-      self.volumeDialogSelectors = {}
-      for viewName in ('Fixed', 'Moving',):
-        self.volumeDialogSelectors[viewName] = slicer.qMRMLNodeComboBox()
-        self.volumeDialogSelectors[viewName].nodeTypes = ( ("vtkMRMLScalarVolumeNode"), "" )
-        self.volumeDialogSelectors[viewName].selectNodeUponCreation = False
-        self.volumeDialogSelectors[viewName].addEnabled = False
-        self.volumeDialogSelectors[viewName].removeEnabled = True
-        self.volumeDialogSelectors[viewName].noneEnabled = True
-        self.volumeDialogSelectors[viewName].showHidden = False
-        self.volumeDialogSelectors[viewName].showChildNodeTypes = True
-        self.volumeDialogSelectors[viewName].setMRMLScene( slicer.mrmlScene )
-        self.volumeDialogSelectors[viewName].setToolTip( "Pick the %s volume." % viewName.lower() )
-        self.volumeSelectorFrame.layout().addRow("%s Volume " % viewName, self.volumeDialogSelectors[viewName])
+      #'fixedVolumeNode Name -landmarks' is create by addFiducial function
+      self.fiducialSelectors["Fixed"].setCurrentNode(slicer.util.getNode(fixedVolumeNode.GetName() + "-landmarks"))
 
-      self.volumeButtonFrame = qt.QFrame()
-      self.volumeButtonFrame.objectName = 'VolumeButtonFrame'
-      self.volumeButtonFrame.setLayout( qt.QHBoxLayout() )
-      self.volumeSelectDialog.layout().addWidget( self.volumeButtonFrame )
+      #add moving fiducial
+      point=[0,0,0]
+      for index in range(movingFiducialNodeTemp.GetNumberOfFiducials()):
+        movingFiducialNodeTemp.GetMarkupPoint(index, 0, point)
+        name='L-'+str(index)
+        self.logic.addFiducial(name,position=point,associatedNode=movingVolumeNode)
+      
+      self.fiducialSelectors["Moving"].setCurrentNode(slicer.util.getNode(movingVolumeNode.GetName() + "-landmarks"))
 
-      self.volumeDialogApply = qt.QPushButton("Apply", self.volumeButtonFrame)
-      self.volumeDialogApply.objectName = 'VolumeDialogApply'
-      self.volumeDialogApply.setToolTip( "Use currently selected volume nodes." )
-      self.volumeButtonFrame.layout().addWidget(self.volumeDialogApply)
+      #add transformed fiducial:must add transform fiducial, otherwise, the 'L-#' button doesn't show up.
+      #transformed fiducial is same as moving fiducial
+      transformedVolumeNode = self.volumeSelectors["Transformed"].currentNode()
+      transformedFiducialNodeTemp = self.fiducialSelectors["Moving"].currentNode()
 
-      self.volumeDialogCancel = qt.QPushButton("Cancel", self.volumeButtonFrame)
-      self.volumeDialogCancel.objectName = 'VolumeDialogCancel'
-      self.volumeDialogCancel.setToolTip( "Cancel current operation." )
-      self.volumeButtonFrame.layout().addWidget(self.volumeDialogCancel)
+      point=[0,0,0]
+      for index in range(movingFiducialNodeTemp.GetNumberOfFiducials()):
+        transformedFiducialNodeTemp.GetMarkupPoint(index, 0, point)
+        name='L-'+str(index)
+        self.logic.addFiducial(name,position=point,associatedNode=transformedVolumeNode)
 
-      self.volumeDialogApply.connect("clicked()", self.onVolumeDialogApply)
-      self.volumeDialogCancel.connect("clicked()", self.volumeSelectDialog.hide)
+      #remove  fixed and moving fiducial. Otherwise, the fixed and moving fiducials will be duplicated(because of lanmark has same associatedID)
+      slicer.mrmlScene.RemoveNode(fixedFiducialNodeTemp)
+      slicer.mrmlScene.RemoveNode(movingFiducialNodeTemp)
 
-    self.volumeSelectLabel.setText( "Pick the volumes to use for landmark-based linear registration" )
-    self.volumeSelectDialog.show()
+    self.onVolumeNodeSelect()
+    self.onLayout()
+
+    #copy fiducials
+
+    # #yingli debug
+    # print 'fixed', self.fiducialSelectors["Fixed"].currentNode().GetNumberOfFiducials()
+    # print 'moving', self.fiducialSelectors["Moving"].currentNode().GetNumberOfFiducials()
+
+    # fixedLandmarksNodeName=self.volumeSelectors["Fixed"].currentNode().GetName() + '-landmarks'
+    
+    # print not slicer.util.getNode(fixedLandmarksNodeName)
+
+    # self.fiducialSelectors["Fixed"].currentNode().SetAttribute("AssociatedNodeID",self.volumeSelectors["Fixed"].currentNode().GetID())
+    # self.fiducialSelectors["Moving"].currentNode().SetAttribute("AssociatedNodeID",self.volumeSelectors["Moving"].currentNode().GetID())
+
+
+    # if not slicer.util.getNode(fixedLandmarksNodeName):
+    #   #fixedFiducialNode = slicer.mrmlScene.GetNodeByID(self.fiducialDialogSelectors["Fixed"].currentNode())
+    #   fixedFiducialNode = self.fiducialSelectors["Fixed"].currentNode()
+    #   fixedLandmarksNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMarkupsFiducialNode')
+    #   fixedLandmarksNode.Copy(fixedFiducialNode)
+    #   slicer.mrmlScene.AddNode(fixedLandmarksNode)
+    #   #fixedLandmarksNode.UnRegister(slicer.mrmlScene)
+    #   fixedLandmarksNode.SetName(fixedLandmarksNodeName)
+
+    #   for fiducialIndex in range(fixedLandmarksNode.GetNumberOfFiducials()):
+    #       fixedLandmarksNode.SetNthFiducialLabel(fiducialIndex,'L-'+str(fiducialIndex))
+          
+    # movingLandmarksNodeName=self.volumeSelectors["Moving"].currentNode().GetName() + '-landmarks'
+
+    # if not slicer.util.getNode(movingLandmarksNodeName):
+    #   #movingFiducialNode = slicer.mrmlScene.GetNodeByID(self.fiducialDialogSelectors["Moving"].currentNode())
+    #   movingFiducialNode = self.fiducialSelectors["Moving"].currentNode()
+    #   movingLandmarksNode = slicer.mrmlScene.AddNewNodeByClass('vtkMRMLMarkupsFiducialNode')
+    #   movingLandmarksNode.Copy(movingFiducialNode)
+
+    #   # movingLandmarksNode = slicer.mrmlScene.CreateNodeByClass('vtkMRMLMarkupsFiducialNode')
+    #   # movingLandmarksNode.Copy(movingFiducialNode)
+    #   # slicer.mrmlScene.AddNode(movingLandmarksNode)
+    #   # movingLandmarksNode.UnRegister(slicer.mrmlScene)
+
+    #   movingLandmarksNode.SetName(movingLandmarksNodeName)
+
+    #   for fiducialIndex in range(movingLandmarksNode.GetNumberOfFiducials()):
+    #       movingLandmarksNode.SetNthFiducialLabel(fiducialIndex,'L-'+str(fiducialIndex))
+
+
+    # #yingli debug
+    # print 'after change to L- -----------'
+    # print 'fixed', self.fiducialSelectors["Fixed"].currentNode().GetNumberOfFiducials()
+    # print 'moving', self.fiducialSelectors["Moving"].currentNode().GetNumberOfFiducials()
+
+    # # # make this active so that the fids will be added to it
+    # # markupsLogic = slicer.modules.markups.logic()
+    # # markupsLogic.SetActiveListID(fixedLandmarksNode)
+    
+    # self.onVolumeNodeSelect()
+    
+    # #yingli debug
+    # print 'after onvolumenodeselect-----------'
+    # print 'fixed', self.fiducialSelectors["Fixed"].currentNode().GetNumberOfFiducials()
+    # print 'moving', self.fiducialSelectors["Moving"].currentNode().GetNumberOfFiducials()
+
+    # #self.onLayout()
+
+    # #yingli debug
+    # print 'after onlayout-----------'
+    # print 'fixed', self.fiducialSelectors["Fixed"].currentNode().GetNumberOfFiducials()
+    # print 'moving', self.fiducialSelectors["Moving"].currentNode().GetNumberOfFiducials()
+
+    # #w.onLandmarkPicked('tip-of-nose')
+    # #landmarksWidget = RegistrationLib.LandmarksWidget(self.logic)
+    # #landmarksWidget.nodeAddedUpdate()
+
+    # #rename fiducials
+    # name = self.fiducialSelectors["Fixed"].currentNode().GetName()+'-landmarks'
+    # self.fiducialSelectors["Fixed"].currentNode().SetName(name)
+
+    # name = self.fiducialSelectors["Moving"].currentNode().GetName()+'-landmarks'
+    # self.fiducialSelectors["Moving"].currentNode().SetName(name)
+
+    # for fiducialIndex in range(self.fiducialSelectors["Fixed"].currentNode().GetNumberOfFiducials()):
+    #     self.fiducialSelectors["Fixed"].currentNode().SetNthFiducialLabel(fiducialIndex,'L-'+str(fiducialIndex))
+
+    # for fiducialIndex in range(self.fiducialSelectors["Moving"].currentNode().GetNumberOfFiducials()):
+    #     self.fiducialSelectors["Moving"].currentNode().SetNthFiducialLabel(fiducialIndex,'L-'+str(fiducialIndex))
+    
+    # self.onVolumeNodeSelect()
+    # self.onLayout()    
+      
 
   # volumeSelectDialog callback (slot)
   def onVolumeDialogApply(self):
@@ -401,9 +526,11 @@ class LandmarkRegistrationEnhancedWidget:
     activeViewNames = []
     for viewName in self.viewNames:
       volumeNode = self.volumeSelectors[viewName].currentNode()
+      
       if volumeNode and not (volumesToShow and viewName not in volumesToShow):
         volumeNodes.append(volumeNode)
         activeViewNames.append(viewName)
+
     import CompareVolumes
     compareLogic = CompareVolumes.CompareVolumesLogic()
     oneViewModes = ('Axial', 'Sagittal', 'Coronal',)
@@ -411,6 +538,7 @@ class LandmarkRegistrationEnhancedWidget:
       self.sliceNodesByViewName = compareLogic.viewerPerVolume(volumeNodes,viewNames=activeViewNames,orientation=layoutMode)
     elif layoutMode == 'Axi/Sag/Cor':
       self.sliceNodesByViewName = compareLogic.viewersPerVolume(volumeNodes)
+
     self.overlayFixedOnTransformed()
     self.updateSliceNodesByVolumeID()
     self.onLandmarkPicked(self.landmarksWidget.selectedLandmark)
@@ -653,10 +781,10 @@ class LandmarkRegistrationEnhancedWidget:
 
 
 #
-# LandmarkRegistrationLogic
+# LandmarkRegistrationEnhancedLogic
 #
 
-class LandmarkRegistrationLogic:
+class LandmarkRegistrationEnhancedLogic:
   """This class should implement all the actual
   computation done by your module.  The interface
   should be such that other python code can import
@@ -692,6 +820,14 @@ class LandmarkRegistrationLogic:
     if hasattr(slicer.modules, 'cropvolume'):
       self.cropLogic = slicer.modules.cropvolume.logic()
 
+  def getFixedMovingVolumeName(self):
+    w = slicer.modules.LandmarkRegistrationEnhancedWidget
+    return (w.volumeSelectors["Fixed"].currentNode().GetName(), w.volumeSelectors["Moving"].currentNode().GetName())
+
+  def getFixedMovingFiducialNode(self):
+    w = slicer.modules.LandmarkRegistrationEnhancedWidget
+    return (w.fiducialSelectors["Fixed"].currentNode(), w.fiducialSelectors["Moving"].currentNode().GetName())
+
 
   def setFiducialListDisplay(self,fiducialList):
     displayNode = fiducialList.GetDisplayNode()
@@ -720,6 +856,7 @@ class LandmarkRegistrationLogic:
     listName = associatedNode.GetName() + "-landmarks"
     fiducialList = slicer.util.getNode(listName)
     if not fiducialList:
+            
       fiducialListNodeID = markupsLogic.AddNewFiducialNode(listName,slicer.mrmlScene)
       fiducialList = slicer.util.getNode(fiducialListNodeID)
       if associatedNode:
@@ -769,6 +906,8 @@ class LandmarkRegistrationLogic:
     """
     state = self.registationState()
     landmarks = self.landmarksForVolumes(volumeNodes)
+
+
     index = 0
     while True:
       landmarkName = 'L-%d' % index
@@ -801,6 +940,7 @@ class LandmarkRegistrationLogic:
       return None
     listName = volumeNode.GetName() + "-landmarks"
     listNode = slicer.util.getNode(listName)
+
     if listNode:
       if listNode.GetAttribute("AssociatedNodeID") != volumeNode.GetID():
         self.setFiducialListDisplay(listNode)
@@ -811,9 +951,11 @@ class LandmarkRegistrationLogic:
     """Return a dictionary of keyed by
     landmark name containing pairs (fiducialListNodes,index)
     Only fiducials that exist for all volumes are returned."""
+
     landmarksByName = {}
     for volumeNode in volumeNodes:
       listForVolume = self.volumeFiducialList(volumeNode)
+      
       if listForVolume:
         fiducialSize = listForVolume.GetNumberOfMarkups()
         for fiducialIndex in range(fiducialSize):
@@ -822,6 +964,7 @@ class LandmarkRegistrationLogic:
             landmarksByName[fiducialName].append((listForVolume,fiducialIndex))
           else:
             landmarksByName[fiducialName] = [(listForVolume,fiducialIndex),]
+
     for fiducialName in landmarksByName.keys():
       if len(landmarksByName[fiducialName]) != len(volumeNodes):
         landmarksByName.__delitem__(fiducialName)
@@ -923,9 +1066,11 @@ class LandmarkRegistrationLogic:
         fiducialAssociatedVolumeID = fiducialList.GetNthMarkupAssociatedNodeID(fiducialIndex)
         landmarkName = fiducialList.GetNthFiducialLabel(fiducialIndex)
         landmarkPosition = fiducialList.GetMarkupPointVector(fiducialIndex,0)
+
         if fiducialAssociatedVolumeID != volumeNode.GetID():
           # fiducial was placed on a viewer associated with the non-active list, so change it
           fiducialList.SetNthMarkupAssociatedNodeID(fiducialIndex,volumeNode.GetID())
+
         # now make sure all other lists have a corresponding fiducial (same name)
         for otherVolumeNode in volumeNodes:
           if otherVolumeNode != volumeNode:
@@ -933,6 +1078,7 @@ class LandmarkRegistrationLogic:
             if addedFiducial:
               addedLandmark = addedFiducial
     slicer.mrmlScene.EndState(slicer.mrmlScene.BatchProcessState)
+
     return addedLandmark
 
   def vtkPointsForVolumes(self, volumeNodes, fiducialNodes):
@@ -959,7 +1105,7 @@ class LandmarkRegistrationLogic:
 
 
 
-class LandmarkRegistrationTest(unittest.TestCase):
+class LandmarkRegistrationEnhancedTest(unittest.TestCase):
   """
   This is the test case for your scripted module.
   """
@@ -1052,7 +1198,7 @@ class LandmarkRegistrationTest(unittest.TestCase):
     """
     self.setUp()
     if scenario == "Basic":
-      self.test_LandmarkRegistrationBasic()
+      self.test_LandmarkRegistrationEnhancedBasic()
     elif scenario == "Affine":
       self.test_LandmarkRegistrationAffine()
     elif scenario == "ThinPlate":
@@ -1062,13 +1208,13 @@ class LandmarkRegistrationTest(unittest.TestCase):
     elif scenario == "ManyLandmarks":
       self.test_LandmarkRegistrationManyLandmarks()
     else:
-      self.test_LandmarkRegistrationBasic()
+      self.test_LandmarkRegistrationEnhancedBasic()
       self.test_LandmarkRegistrationAffine()
       self.test_LandmarkRegistrationThinPlate()
       self.test_LandmarkRegistrationVTKv6Picking()
       self.test_LandmarkRegistrationManyLandmarks()
 
-  def test_LandmarkRegistrationBasic(self):
+  def test_LandmarkRegistrationEnhancedBasic(self):
     """
     This tests basic landmarking with two volumes
     """
@@ -1086,11 +1232,12 @@ class LandmarkRegistrationTest(unittest.TestCase):
     mainWindow = slicer.util.mainWindow()
     mainWindow.moduleSelector().selectModule('LandmarkRegistrationEnhanced')
 
-    w = slicer.modules.LandmarkRegistrationWidget
+    w = slicer.modules.LandmarkRegistrationEnhancedWidget
     w.volumeSelectors["Fixed"].setCurrentNode(dtiBrain)
     w.volumeSelectors["Moving"].setCurrentNode(mrHead)
+  
 
-    logic = LandmarkRegistrationLogic()
+    logic = LandmarkRegistrationEnhancedLogic()
 
     for name,point in (
       ('middle-of-right-eye', [35.115070343017578, 74.803565979003906, -21.032917022705078]),
@@ -1108,7 +1255,7 @@ class LandmarkRegistrationTest(unittest.TestCase):
 
     w.onVolumeNodeSelect()
     w.onLayout()
-    w.onLandmarkPicked('tip-of-nose')
+    w.onLandmarkPicked('right-ear')
 
     self.delayDisplay('test_LandmarkRegistrationBasic passed!')
 
@@ -1237,7 +1384,7 @@ class LandmarkRegistrationTest(unittest.TestCase):
     w.cam = w.ren.GetActiveCamera()
     print(w.favpm)
 
-    logic = LandmarkRegistrationLogic()
+    logic = LandmarkRegistrationEnhancedLogic()
 
     # initiate registration
     w.registrationTypeButtons["ThinPlate"].checked = True
@@ -1306,7 +1453,7 @@ class LandmarkRegistrationTest(unittest.TestCase):
 
     self.delayDisplay('Volumes set up',100)
 
-    logic = LandmarkRegistrationLogic()
+    logic = LandmarkRegistrationEnhancedLogic()
 
 
     # move the mouse to the middle of the widget so that the first
