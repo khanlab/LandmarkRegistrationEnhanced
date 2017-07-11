@@ -5,5 +5,5 @@
 * LandmarkRegistrationEnhanced.py: main python script.
 
 ### Getting started:
-Copy (and overwrite) to slicer's sub-folder:qt-scripted-modules 
-  Windows: C:\Program Files\Slicer 4.6.2\lib\Slicer-4.6\qt-scripted-modules
+Copy (and overwrite) to slicer's sub-folder:qt-scripted-modules.  
+* Windows: C:\Program Files\Slicer 4.6.2\lib\Slicer-4.6\qt-scripted-modules
