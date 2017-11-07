@@ -1,5 +1,5 @@
 # Enhanced version of slicer's landmark registration module 
-## Maintainer: YingLi Lu yingliu@gmail.com
+## Maintainer: YingLi Lu yinglilu@gmail.com
 
 * RegistrationLib:/ python scripts for adding affineAndThinplate registration(Do affine registration first, use its output as input to the thinplate registration).
 * LandmarkRegistrationEnhanced.py: main python script.
